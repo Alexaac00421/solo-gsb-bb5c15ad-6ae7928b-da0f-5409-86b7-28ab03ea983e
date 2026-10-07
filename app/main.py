@@ -19,15 +19,17 @@ from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
-    version="1.1.0",
+    version="1.2.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
                  "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
                  "多条更正正式提交前的只读批量预演（不写历史、不占版本号）、"
                  "值班员凭本地凭证提交/审核待审更正提案（批准时在同一事务内"
-                 "重验整批并写入原审计批次），以及调度员安排跨规程作业前的"
-                 "版本覆盖检查（逐段整组状态）。"),
+                 "重验整批并写入原审计批次），调度员安排跨规程作业前的版本"
+                 "覆盖检查（逐段整组状态），以及按已提交审计批次追查受规程"
+                 "变动影响的既有作业规程包（整批结果比较、键集分页、只读"
+                 "一致快照）。"),
 )
 
 
@@ -83,6 +85,7 @@ def index() -> dict:
                 "POST /api/v1/correction-proposals/{proposal_id}/approve",
                 "POST /api/v1/correction-proposals/{proposal_id}/reject",
                 "GET  /api/v1/audit/events",
+                "GET  /api/v1/audit/batches/{batch_seq}/package-impacts",
             ]}
 
 
@@ -377,3 +380,23 @@ def audit_events(cursor: str | None = None,
     422 invalid_page_limit。
     """
     return service.read_change_feed(cursor, limit)
+
+
+@app.get("/api/v1/audit/batches/{batch_seq}/package-impacts")
+def audit_batch_package_impacts(batch_seq: str,
+                                cursor: str | None = None,
+                                limit: str | None = None) -> dict:
+    """批次对既有作业规程包的影响追查：调度员按已提交审计批次追查。
+
+    路径参数 ``batch_seq`` 为审计批次号（取 ``/api/v1/audit/events`` 事件的
+    ``batch_seq``）；查询参数 ``cursor``（上一页的 ``next_cursor``，省略/
+    空/``0`` 为起始）与 ``limit``（每页受影响包数，默认 100、最大 1000）。
+
+    返回该批次提交前已固定的包中，包内规程在原作业时刻的实际适用版本因本
+    批发布/更正/撤回而变化的包标识、变化编号及批次前后版本号（无适用版本
+    记为 null）。同批多条事件按整批结果比较、撤回沿用现有父版本恢复与
+    知悉时刻边界语义，包固定内容不变；按包固定顺序分页，每页使用一致只读
+    快照、翻页不重现不遗漏。批次非法 -> 422 invalid_batch；游标非法 ->
+    422 invalid_cursor；页大小非法 -> 422 invalid_page_limit。
+    """
+    return service.trace_batch_package_impacts(batch_seq, cursor, limit)

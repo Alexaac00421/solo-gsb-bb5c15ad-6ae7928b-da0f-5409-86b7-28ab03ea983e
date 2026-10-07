@@ -271,7 +271,7 @@ def invalid_cursor(value: str) -> DomainError:
 def invalid_page_limit(value: str) -> DomainError:
     return DomainError(
         "invalid_page_limit",
-        f"每页事件上限非法：{value!r} 必须是 1..1000 的整数",
+        f"每页上限非法：{value!r} 必须是 1..1000 的整数",
         http_status=422, details={"limit": value, "max": 1000})
 
 
@@ -284,6 +284,17 @@ def page_limit_too_small(limit: int, batch_seq: int, batch_size: int) -> DomainE
         http_status=422,
         details={"limit": limit, "batch_seq": batch_seq,
                  "batch_size": batch_size})
+
+
+# ------------------------------------------------------- 批次对既有包的影响追查
+
+
+def invalid_batch(value) -> DomainError:
+    return DomainError(
+        "invalid_batch",
+        f"非法批次号 {value!r}：batch_seq 必须指向某条已提交审计批次的"
+        f"正整数（可由 /api/v1/audit/events 的事件 batch_seq 取得）",
+        http_status=422, details={"batch_seq": value})
 
 
 # ---------------------------------------------------------------- 待审更正提案

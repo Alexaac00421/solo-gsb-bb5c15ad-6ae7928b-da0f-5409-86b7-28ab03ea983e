@@ -114,6 +114,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import uuid
@@ -2051,3 +2052,233 @@ def review_package(package_id_raw: str, review_known_raw: str) -> dict:
             "count": len(items),
             "all_match": all_match,
             "items": items}
+
+
+# ------------------------------------------------- 批次对既有作业规程包的影响追查
+
+DEFAULT_IMPACT_LIMIT = 100
+MAX_IMPACT_LIMIT = 1000
+
+
+def _parse_batch_seq(raw) -> int:
+    """追查入参的审计批次号：必须是指向已提交批次的正整数。"""
+    text = "" if raw is None else str(raw).strip()
+    if not text.isdigit() or int(text) <= 0:
+        raise errors.invalid_batch(raw)
+    return int(text)
+
+
+def _parse_impact_limit(raw) -> int:
+    """每页受影响包上限：整数 1..1000（非法 -> 422 invalid_page_limit）。"""
+    if raw is None:
+        return DEFAULT_IMPACT_LIMIT
+    text = str(raw).strip()
+    if not text.isdigit() or not (1 <= int(text) <= MAX_IMPACT_LIMIT):
+        raise errors.invalid_page_limit(text)
+    return int(text)
+
+
+def _encode_impact_cursor(created_at: str, package_id: str) -> str:
+    """不透明键集游标：编码 (created_at, id)，调用方只能原样回传。"""
+    raw = json.dumps([created_at, package_id], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_impact_cursor(raw: str | None) -> tuple[str, str] | None:
+    """解析游标：省略/空串/``"0"`` 为起始游标；伪造/损坏 -> 422
+    invalid_cursor。返回 None 表示起始。"""
+    if raw is None or not str(raw).strip() or str(raw).strip() == "0":
+        return None
+    token = str(raw).strip()
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+        created_at, package_id = data
+        if not isinstance(created_at, str) or not isinstance(package_id, str):
+            raise ValueError
+        return created_at, package_id
+    except Exception:
+        raise errors.invalid_cursor(token)
+
+
+def trace_batch_package_impacts(batch_seq_raw, cursor_raw=None,
+                                limit_raw=None) -> dict:
+    """按已提交审计批次追查受规程变动影响的**既有作业规程包**（只读）。
+
+    返回该批次**提交前已固定**（``packages.created_at < 批次提交时刻``）的
+    包中，包内规程在**原作业时刻**的实际适用版本因本批发布、更正或撤回而
+    发生变化的包。每个受影响包给出包标识、逐项变化编号及批次前后版本号，
+    无适用版本一侧记为 ``null``；包的固定内容本身不做任何改动。
+
+    前后版本均按"反事实批次世界"解析，且完全沿用现有回溯/撤回语义：
+
+    * 前侧（before_revision）= 截至 ``batch_seq-1`` 的世界里，包内某规程在
+      包的原作业时刻实际适用的版本号；
+    * 后侧（after_revision）= 截至 ``batch_seq``（即本批已提交）的世界里，
+      同一作业时刻实际适用的版本号；
+    * 版本可见性按其发布/撤回所在批次序号裁剪，而**非**按包内知悉时刻——
+      本追查回答的是"本批给历史带来了什么差异"，包内知悉时刻只决定固定了
+      什么，不参与差异判定；
+    * 同批多条事件按**整批结果**与前一批次世界比较，不把批内中间状态当作
+      最终变化；撤回沿用现有"撤回即事件、恢复父版本、知悉时刻边界含等号"
+      的语义（批次序号即等价的边界位点）；
+    * 首次发布只引入新编号，既有包内规程不可能在批次前引用它，故发布批次
+      对既有包不产生变化（升级回填的单事件批次同理可追查）。
+
+    结果按**包固定顺序**（created_at, id）键集分页，整页计算与读取都在进入
+    时固定的同一只读快照内完成，翻页不重现、不遗漏；游标不透明，只能使用
+    服务端返回的值。批次号非法/不指向已提交批次 -> 422 invalid_batch；游标
+    伪造或不指向本批之前已固定的包 -> 422 invalid_cursor；页大小非
+    1..1000 整数 -> 422 invalid_page_limit。全程只读、不写任何历史。
+    """
+    batch_seq = _parse_batch_seq(batch_seq_raw)
+    limit = _parse_impact_limit(limit_raw)
+    after_key = _decode_impact_cursor(cursor_raw)
+
+    with read_snapshot() as conn:
+        batch = conn.execute(
+            "SELECT seq, event_count, "
+            "(SELECT MIN(event_time) FROM audit_events "
+            " WHERE batch_seq = audit_batches.seq) AS committed_at "
+            "FROM audit_batches WHERE seq = ?",
+            (batch_seq,)).fetchone()
+        if batch is None:
+            raise errors.invalid_batch(batch_seq_raw)
+        committed_at = batch["committed_at"]
+
+        if after_key is not None:
+            anchor = conn.execute(
+                "SELECT 1 FROM packages WHERE created_at = ? AND id = ?",
+                after_key).fetchone()
+            # 游标必须指向本批提交前已固定的某个包；伪造或属于其他批次
+            # 之后结果集的位点都按非法游标拒绝。
+            if anchor is None or not (after_key[0] < committed_at):
+                raise errors.invalid_cursor(str(cursor_raw).strip())
+
+        # 本批提交前已固定的包（严格早于：等时刻与批次同事务序不可分辨，
+        # 且固定本身不写审计，"提交前"不包含同刻固定）。
+        packages = conn.execute(
+            "SELECT * FROM packages WHERE created_at < ? "
+            "ORDER BY created_at, id", (committed_at,)).fetchall()
+
+        impacts: list[dict] = []
+        if packages:
+            pkg_ids = [p["id"] for p in packages]
+            placeholders = ",".join("?" * len(pkg_ids))
+            item_rows = conn.execute(
+                f"SELECT * FROM package_items WHERE package_id IN "
+                f"({placeholders}) ORDER BY package_id, position",
+                tuple(pkg_ids)).fetchall()
+            proc_ids = sorted({r["procedure_id"] for r in item_rows})
+            p_placeholders = ",".join("?" * len(proc_ids))
+            version_rows = conn.execute(
+                f"""
+                SELECT v.*,
+                       (SELECT MIN(ae.batch_seq) FROM audit_events ae
+                         WHERE ae.version_id = v.id
+                           AND ae.operation IN ('release', 'correction')
+                       ) AS pub_batch_seq
+                  FROM versions v
+                 WHERE v.procedure_id IN ({p_placeholders})
+                """, tuple(proc_ids)).fetchall()
+            withdrawal_rows = conn.execute(
+                f"""
+                SELECT w.version_id AS version_id,
+                       (SELECT MIN(ae.batch_seq) FROM audit_events ae
+                         WHERE ae.version_id = w.version_id
+                           AND ae.operation = 'withdrawal'
+                       ) AS wd_batch_seq
+                  FROM withdrawals w
+                 WHERE w.version_id IN
+                       (SELECT id FROM versions
+                         WHERE procedure_id IN ({p_placeholders}))
+                """, tuple(proc_ids)).fetchall()
+
+            versions_by_proc: dict[int, list[sqlite3.Row]] = {}
+            for r in version_rows:
+                versions_by_proc.setdefault(r["procedure_id"], []).append(r)
+            # 版本行与其发布事件一一对应（写入同事务、回填补齐）；上面的
+            # 关联子查询按 version 聚合，撤回事件不会令版本行重复。
+            pub_seq = {r["id"]: r["pub_batch_seq"] for r in version_rows}
+            wd_seq = {r["version_id"]: r["wd_batch_seq"]
+                      for r in withdrawal_rows}
+
+            items_by_pkg: dict[str, list[sqlite3.Row]] = {}
+            for r in item_rows:
+                items_by_pkg.setdefault(r["package_id"], []).append(r)
+
+            for pkg in packages:
+                work_time = pkg["work_time"]
+                changes: list[dict] = []
+                for pi in items_by_pkg.get(pkg["id"], []):
+                    rows = versions_by_proc.get(pi["procedure_id"], [])
+                    before_rev = _effective_revision_at_seq(
+                        rows, pub_seq, wd_seq, work_time, batch_seq - 1)
+                    after_rev = _effective_revision_at_seq(
+                        rows, pub_seq, wd_seq, work_time, batch_seq)
+                    if before_rev == after_rev:
+                        continue
+                    changes.append({"number": pi["number"],
+                                    "before_revision": before_rev,
+                                    "after_revision": after_rev})
+                if changes:
+                    impacts.append({"package_id": pkg["id"],
+                                    "work_time": work_time,
+                                    "created_at": pkg["created_at"],
+                                    "change_count": len(changes),
+                                    "changes": changes})
+
+        # 键集分页：游标位点之后的受影响包切片；整页列表来自同一快照，
+        # 翻页不重现、不遗漏。
+        start = 0
+        if after_key is not None:
+            start = next(
+                (i for i, im in enumerate(impacts)
+                 if (im["created_at"], im["package_id"]) > after_key),
+                len(impacts))
+        page = impacts[start:start + limit]
+        has_more = start + limit < len(impacts)
+        if page:
+            next_cursor = _encode_impact_cursor(
+                page[-1]["created_at"], page[-1]["package_id"])
+        else:
+            next_cursor = ("0" if after_key is None
+                           else str(cursor_raw).strip())
+
+    return {"batch_seq": batch_seq,
+            "committed_at": committed_at,
+            "cursor": "0" if after_key is None else str(cursor_raw).strip(),
+            "next_cursor": next_cursor,
+            "limit": limit,
+            "has_more": has_more,
+            "count": len(page),
+            "items": page}
+
+
+def _effective_revision_at_seq(rows: list[sqlite3.Row],
+                               pub_seq: dict[int, int],
+                               wd_seq: dict[int, int],
+                               work_time: str,
+                               cutoff_seq: int) -> int | None:
+    """按"截至 cutoff_seq 批次的反事实世界"解析某规程在作业时刻的适用版本号。
+
+    与 :func:`_resolve_effective` 的双时间维语义完全一致，只是把知悉时刻
+    可见性替换为等价的批次序号裁剪：版本已发布当且仅当其发布批次
+    ``<= cutoff``；版本仍生效（未撤回或撤回批次晚于该位点，含等号边界）
+    当且仅当它没有撤回事件或其撤回批次 ``> cutoff``。在覆盖作业时刻
+    （左闭右开）的可见候选中沿 supersedes 链取最深者，无覆盖返回 None。
+    """
+    candidates: list[sqlite3.Row] = []
+    for r in rows:
+        if pub_seq.get(r["id"], 1 << 60) > cutoff_seq:
+            continue
+        if wd_seq.get(r["id"], 1 << 60) <= cutoff_seq:
+            continue                        # 撤回批次已在世界内：版本不可见
+        if r["valid_start"] <= work_time < r["valid_end"]:
+            candidates.append(r)
+    if not candidates:
+        return None
+    by_id = {r["id"]: r for r in rows}
+    depth_cache: dict[int, int] = {}
+    best = _effective_at(work_time, candidates, by_id, depth_cache)
+    return None if best is None else best["revision"]

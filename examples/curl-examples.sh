@@ -655,6 +655,67 @@ curl -sS -i "$BASE_URL/api/v1/audit/events?limit=0"; echo
 curl -sS -i "$BASE_URL/api/v1/audit/events?limit=1001"; echo
 
 # ------------------------------------------------------------------------
+# 批次对既有作业规程包的影响追查（本轮新增）：调度员按已提交审计批次号追查
+# 该批提交前已固定的包中，包内规程在原作业时刻的实际适用版本因本批发布/
+# 更正/撤回而变化的包标识、变化编号及批次前后版本号（无适用版本为 null）。
+# 只读、按包固定顺序键集分页、每页一致快照；升级回填的单事件批次同样可查。
+# ------------------------------------------------------------------------
+
+# --- 41c-1. 准备：发布规程，固定一个 3 月作业的包 --------------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-IMPACT-001",
+        "body": "追查演示初版。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }' >/dev/null
+REL_TS=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=1000" \
+          | python3 -c 'import json,sys;print(json.load(sys.stdin)["events"][-1]["event_time"])')
+curl -sS -X POST "$BASE_URL/api/v1/packages" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_time\": \"2026-03-15T08:00:00Z\",
+        \"known_as_of\": \"$REL_TS\",
+        \"numbers\": [\"SOP-IMPACT-001\"]
+      }" >/dev/null
+
+# --- 41c-2. 提交 3 月更正批次，并取出其批次号 batch_seq ---------------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-IMPACT-001", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "追查演示三月更正。"
+      }' >/dev/null
+BATCH_SEQ=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=1000" | python3 -c '
+import json,sys
+ev=json.load(sys.stdin)["events"]
+print(next(e["batch_seq"] for e in reversed(ev) if e["operation"]=="correction"))')
+echo "更正批次号 batch_seq = $BATCH_SEQ"
+
+# --- 41c-3. 追查该批次影响的既有包：0 -> 1 ----------------------------------
+curl -sS "$BASE_URL/api/v1/audit/batches/$BATCH_SEQ/package-impacts?limit=100" \
+  | python3 -m json.tool
+
+# --- 41c-4. 撤回更正后追查撤回批次：1 -> 0（沿用父版本恢复语义） ------------
+curl -sS -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-IMPACT-001", "revision": 1}' >/dev/null
+WD_SEQ=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=1000" | python3 -c '
+import json,sys
+ev=json.load(sys.stdin)["events"]
+print(next(e["batch_seq"] for e in reversed(ev) if e["operation"]=="withdrawal"))')
+curl -sS "$BASE_URL/api/v1/audit/batches/$WD_SEQ/package-impacts" | python3 -m json.tool
+
+# --- 41d. 非法批次 / 上限 / 游标 -> 422 -------------------------------------
+curl -sS -i "$BASE_URL/api/v1/audit/batches/0/package-impacts"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/batches/999999/package-impacts"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/batches/$BATCH_SEQ/package-impacts?limit=0"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/batches/$BATCH_SEQ/package-impacts?cursor=garbage"; echo
+
+# ------------------------------------------------------------------------
 # 跨规程版本覆盖检查（本轮新增）：调度员安排跨规程作业前，输入非空且不重
 # 复的规程编号、非空作业区间与知悉时刻；服务在同一只读快照内按全体编号
 # 的版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并

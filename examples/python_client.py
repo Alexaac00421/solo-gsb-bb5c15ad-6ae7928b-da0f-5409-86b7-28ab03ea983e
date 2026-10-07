@@ -156,6 +156,9 @@ def main() -> None:
     # 17) 待审更正提案（凭证提交 / 他人审核 / 批准时事务内重验整批）
     _correction_proposal_examples()
 
+    # 18) 批次对既有作业规程包的影响追查（本轮新增）
+    _batch_impact_examples()
+
 
 def _correction_proposal_examples() -> None:
     """待审更正提案：提交不可变提案 -> 他人批准/拒绝 -> 查询发布版本。"""
@@ -429,6 +432,69 @@ def _audit_feed_examples() -> None:
     show("15.5c limit=0 -> 422 invalid_page_limit", status, res)
     status, res = call("GET", "/api/v1/audit/events?limit=1001")
     show("15.5d limit=1001 -> 422 invalid_page_limit", status, res)
+
+
+def _batch_impact_examples() -> None:
+    """批次对既有作业规程包的影响追查：整批结果比较、键集分页、只读快照。"""
+    import urllib.parse
+
+    number = "SOP-DEMO-IMPACT-001"
+
+    # 18.1) 发布规程，取发布时刻作为包的知悉时刻，在更正前固定一个 3 月作业包
+    call("POST", "/api/v1/releases", {
+        "number": number, "body": "追查演示初版。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+    status, feed = call("GET", "/api/v1/audit/events?limit=1000")
+    release_ts = feed["events"][-1]["event_time"]
+    call("POST", "/api/v1/packages", {
+        "work_time": "2026-03-15T08:00:00Z", "known_as_of": release_ts,
+        "numbers": [number]})
+
+    # 18.2) 提交一个更正批次（3 月子区间），从审计日志取其 batch_seq
+    call("POST", "/api/v1/corrections", {
+        "number": number, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "追查演示 3 月更正。"})
+    status, feed = call("GET", "/api/v1/audit/events?limit=1000")
+    corr_batch = next(e["batch_seq"] for e in reversed(feed["events"])
+                      if e["operation"] == "correction")
+
+    # 18.3) 追查该批次：既有 3 月包 SOP 实际适用版本 0 -> 1
+    q = urllib.parse.urlencode({"limit": 100})
+    status, res = call("GET",
+                       f"/api/v1/audit/batches/{corr_batch}/package-impacts?{q}")
+    show("18.3 更正批次对既有包的影响（before_revision 0 -> after_revision 1）",
+         status, res)
+    next_cursor = res["next_cursor"]
+
+    # 18.4) 键集翻页：尾游标再读为空页、游标不变
+    q = urllib.parse.urlencode({"cursor": next_cursor, "limit": 100})
+    status, res = call("GET",
+                       f"/api/v1/audit/batches/{corr_batch}/package-impacts?{q}")
+    show("18.4 尾游标再读 -> 空页（游标保持）", status, res)
+
+    # 18.5) 撤回批次：3 月子区间恢复父版本，包前后 1 -> 0
+    call("POST", "/api/v1/withdrawals",
+         {"number": number, "revision": 1})
+    status, feed = call("GET", "/api/v1/audit/events?limit=1000")
+    wd_batch = next(e["batch_seq"] for e in reversed(feed["events"])
+                    if e["operation"] == "withdrawal")
+    status, res = call(
+        "GET", f"/api/v1/audit/batches/{wd_batch}/package-impacts")
+    show("18.5 撤回批次对既有包的影响（1 -> 0，恢复父版本语义）", status, res)
+
+    # 18.6) 非法入参明确拒绝
+    status, res = call("GET", "/api/v1/audit/batches/0/package-impacts")
+    show("18.6a 批次号 0 -> 422 invalid_batch", status, res)
+    status, res = call("GET",
+                       f"/api/v1/audit/batches/{corr_batch}/package-impacts?limit=0")
+    show("18.6b limit=0 -> 422 invalid_page_limit", status, res)
+    status, res = call(
+        "GET",
+        f"/api/v1/audit/batches/{corr_batch}/package-impacts?cursor=garbage")
+    show("18.6c 非法游标 -> 422 invalid_cursor", status, res)
 
 
 def _correction_preview_examples() -> None:

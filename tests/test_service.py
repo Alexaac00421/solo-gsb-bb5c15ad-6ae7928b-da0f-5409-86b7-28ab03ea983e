@@ -3298,6 +3298,85 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(r.status_code, 422, bad)
             self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
 
+    def test_batch_package_impacts_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版",
+            "valid_start": t1, "valid_end": t5})
+        known = c.get("/api/v1/audit/events").json()["events"][-1]["event_time"]
+        # 本批提交前固定两个包：3 月作业受影响、5 月作业不受影响
+        pin_mar = c.post("/api/v1/packages", json={
+            "work_time": t2, "known_as_of": known, "numbers": [n]}).json()["id"]
+        c.post("/api/v1/packages", json={
+            "work_time": t4, "known_as_of": known, "numbers": [n]})
+        r = c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月"})
+        self.assertEqual(r.status_code, 201)
+        feed = c.get("/api/v1/audit/events", params={"limit": 1000}).json()
+        batch_seq = next(e["batch_seq"] for e in feed["events"]
+                         if e["operation"] == "correction")
+
+        path = f"/api/v1/audit/batches/{batch_seq}/package-impacts"
+        r = c.get(path)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["batch_seq"], batch_seq)
+        self.assertEqual(body["cursor"], "0")
+        self.assertFalse(body["has_more"])
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["items"][0]["package_id"], pin_mar)
+        self.assertEqual(body["items"][0]["changes"],
+                         [{"number": n, "before_revision": 0,
+                           "after_revision": 1}])
+
+        # 翻页参数回显且尾页游标保持
+        r = c.get(path, params={"cursor": body["next_cursor"], "limit": 1})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["items"], [])
+        self.assertEqual(r.json()["next_cursor"], body["next_cursor"])
+
+        # 撤回批次：3 月包 1->0
+        r = c.post("/api/v1/withdrawals", json={"number": n, "revision": 1})
+        self.assertEqual(r.status_code, 201)
+        feed = c.get("/api/v1/audit/events", params={"limit": 1000}).json()
+        wd_seq = next(e["batch_seq"] for e in feed["events"]
+                      if e["operation"] == "withdrawal")
+        r = c.get(f"/api/v1/audit/batches/{wd_seq}/package-impacts")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["items"][0]["changes"],
+                         [{"number": n, "before_revision": 1,
+                           "after_revision": 0}])
+
+        # 端点列入根索引
+        self.assertIn(
+            f"GET  /api/v1/audit/batches/{batch_seq}/package-impacts"
+            .replace(str(batch_seq), "{batch_seq}"),
+            c.get("/").json()["endpoints"])
+
+    def test_batch_package_impacts_bad_params_over_http(self):
+        c = self.client
+        r = c.post("/api/v1/releases", json={
+            "number": self._n(), "body": "初版",
+            "valid_start": t1, "valid_end": t5})
+        self.assertEqual(r.status_code, 201)
+        base = "/api/v1/audit/batches"
+        # 批次非法（0/负数/非数字/不存在）-> 422 invalid_batch
+        for bad in ("0", "-1", "abc", "999999"):
+            r = c.get(f"{base}/{bad}/package-impacts")
+            self.assertEqual(r.status_code, 422, bad)
+            self.assertEqual(r.json()["error"]["code"], "invalid_batch")
+        # 页大小非法 -> 422 invalid_page_limit
+        r = c.get(f"{base}/1/package-impacts", params={"limit": "1001"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
+        # 游标损坏 -> 422 invalid_cursor
+        r = c.get(f"{base}/1/package-impacts",
+                  params={"cursor": "garbage-cursor"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_cursor")
+
 
 class CorrectionProposalHttpTests(unittest.TestCase):
     """待审更正提案 HTTP 层：Bearer 凭证、角色、审核人分离、完整批准流程。"""
@@ -3830,6 +3909,412 @@ class AuditBackfillTests(unittest.TestCase):
                 [("release", "UPG-1", 0)])
         finally:
             object.__setattr__(settings, "db_path", old_path)
+
+
+class BatchPackageImpactTests(unittest.TestCase):
+    """按审计批次追查受规程变动影响的既有作业规程包（整批比较、键集分页）。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _seqs(self) -> dict[tuple, int]:
+        return {(e["operation"], e["number"], e["revision"]): e["batch_seq"]
+                for e in service.read_change_feed(None, 1000)["events"]}
+
+    def _known(self) -> str:
+        """包固定知悉时刻：取当前最新审计事件的服务端时刻（晚于已发布版本）。"""
+        return service.read_change_feed(None, 1000)["events"][-1]["event_time"]
+
+    def test_no_packages_returns_empty(self):
+        release("BPI-A")
+        seq = self._seqs()[("release", "BPI-A", 0)]
+        page = service.trace_batch_package_impacts(seq)
+        self.assertEqual(page["count"], 0)
+        self.assertEqual(page["items"], [])
+        self.assertEqual(page["cursor"], "0")
+        self.assertEqual(page["next_cursor"], "0")
+        self.assertFalse(page["has_more"])
+
+    def test_correction_batch_flags_only_pinned_packages_in_changed_interval(self):
+        release("BPI-A")
+        # 三月作业时刻的包（受 3 月更正影响）与五月作业时刻的包（不受影响）
+        pin_mar = service.create_package(t2, self._known(),
+                                         ["BPI-A"])["id"]
+        pin_may = service.create_package(t4, self._known(),
+                                         ["BPI-A"])["id"]
+        correct("BPI-A", 0, t2, t3, "三月更正")
+        seq = self._seqs()[("correction", "BPI-A", 1)]
+
+        page = service.trace_batch_package_impacts(seq, None, 100)
+        self.assertEqual(page["count"], 1)
+        impact = page["items"][0]
+        self.assertEqual(impact["package_id"], pin_mar)
+        self.assertEqual(impact["changes"],
+                         [{"number": "BPI-A", "before_revision": 0,
+                           "after_revision": 1}])
+        self.assertNotIn(pin_may, [im["package_id"] for im in page["items"]])
+
+    def test_package_pinned_after_batch_is_excluded(self):
+        release("BPI-B")
+        res = correct("BPI-B", 0, t2, t3, "三月更正")
+        seq = self._seqs()[("correction", "BPI-B", 1)]
+        # 批次提交后才固定的包（created_at 晚于批次提交时刻）不在追查范围
+        service.create_package(t2, res["published_at"], ["BPI-B"])
+        page = service.trace_batch_package_impacts(seq)
+        self.assertEqual(page["count"], 0)
+
+    def test_release_batch_does_not_affect_existing_packages(self):
+        # 先有一个引用其他规程的既有包，再发布全新规程：发布不改变既有包
+        release("BPI-OLD")
+        service.create_package(t2, self._known(), ["BPI-OLD"])
+        service.publish_releases([item("BPI-NEW-1"), item("BPI-NEW-2")])
+        seqs = self._seqs()
+        for key in (("release", "BPI-NEW-1", 0),
+                    ("release", "BPI-NEW-2", 0)):
+            page = service.trace_batch_package_impacts(seqs[key])
+            self.assertEqual(page["items"], [])
+
+    def test_multi_event_batch_compared_as_whole_not_intermediate(self):
+        # 同批两条更正：r1 覆盖 3 月，r2 以拟生成 r1 为基版覆盖 3/10-3/20。
+        # 整批结果：3/10-20 为 r2，其余 3 月为 r1；作业时刻 3/15 的包
+        # 前后差异必须是 0->2（不是批内中间状态 0->1）。
+        work_mid = iso(_T + timedelta(days=44))      # 2026-02-14，落在 r2 内
+        release("BPI-C")
+        pin = service.create_package(work_mid, self._known(),
+                                     ["BPI-C"])["id"]
+        service.submit_corrections([
+            item("BPI-C", "r1", t2, t3, base=0),
+            item("BPI-C", "r2", iso(_T + timedelta(days=39)),
+                 iso(_T + timedelta(days=49)), base=1),
+        ])
+        seq = self._seqs()[("correction", "BPI-C", 2)]
+        page = service.trace_batch_package_impacts(seq)
+        self.assertEqual(page["count"], 1)
+        self.assertEqual(page["items"][0]["package_id"], pin)
+        self.assertEqual(page["items"][0]["changes"],
+                         [{"number": "BPI-C", "before_revision": 0,
+                           "after_revision": 2}])
+
+    def test_withdrawal_batch_restores_parent_revision(self):
+        release("BPI-D")
+        correct("BPI-D", 0, t2, t3, "三月更正")
+        pin = service.create_package(t2, self._known(),
+                                     ["BPI-D"])["id"]
+        # 撤回 r1（叶子）：其 3 月子区间恢复父版本 r0
+        withdraw("BPI-D", 1)
+        seq = self._seqs()[("withdrawal", "BPI-D", 1)]
+        page = service.trace_batch_package_impacts(seq)
+        self.assertEqual(page["count"], 1)
+        self.assertEqual(page["items"][0]["package_id"], pin)
+        self.assertEqual(page["items"][0]["changes"],
+                         [{"number": "BPI-D",
+                           "before_revision": 1, "after_revision": 0}])
+
+    def test_chained_correction_then_withdrawal_leaf_and_parent(self):
+        # r1 覆盖 3 月；r2 覆盖 3/10-20。撤回 r2（叶子）：t2(1/31) 包不在
+        # r2 区间、无变化，3/10.5 的包 2->1（撤回恢复父版本）。r1 因存在
+        # 子更正行（r2 即使已撤回也仍在历史中）不可再撤回——沿用现有规则。
+        release("BPI-E")
+        correct("BPI-E", 0, t2, t3, "r1")
+        pin = service.create_package(t2, self._known(),
+                                     ["BPI-E"])["id"]
+        pin_mid = service.create_package(
+            iso(_T + timedelta(days=39, hours=12)),
+            self._known(), ["BPI-E"])["id"]
+        correct("BPI-E", 1, iso(_T + timedelta(days=39)),
+                iso(_T + timedelta(days=49)), "r2")
+        withdraw("BPI-E", 2)
+        seqs = self._seqs()
+        page = service.trace_batch_package_impacts(
+            seqs[("withdrawal", "BPI-E", 2)])
+        affected = {im["package_id"]: im["changes"]
+                    for im in page["items"]}
+        self.assertNotIn(pin, affected)
+        self.assertEqual(affected[pin_mid],
+                         [{"number": "BPI-E", "before_revision": 2,
+                           "after_revision": 1}])
+        # r1 仍带子更正行，撤回被现有规则拒绝（409 version_has_children）
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("BPI-E", 1)
+        self.assertEqual(ctx.exception.code, "version_has_children")
+
+    def test_withdrawal_after_re_correction_on_restored_interval(self):
+        # 撤回 r2 -> 恢复区间可再次更正为 r3 -> 撤回 r3：pin_mid 2->3->2
+        release("BPI-E2")
+        correct("BPI-E2", 0, t2, t3, "r1")
+        pin_mid = service.create_package(
+            iso(_T + timedelta(days=39, hours=12)),
+            self._known(), ["BPI-E2"])["id"]
+        correct("BPI-E2", 1, iso(_T + timedelta(days=39)),
+                iso(_T + timedelta(days=49)), "r2")
+        withdraw("BPI-E2", 2)
+        correct("BPI-E2", 1, iso(_T + timedelta(days=39)),
+                iso(_T + timedelta(days=49)), "r3")
+        withdraw("BPI-E2", 3)
+        seqs = self._seqs()
+        # 撤回 r3 批次：3/10.5 包 3->2（恢复到 r1）
+        page = service.trace_batch_package_impacts(
+            seqs[("withdrawal", "BPI-E2", 3)])
+        self.assertEqual(page["items"][0]["package_id"], pin_mid)
+        self.assertEqual(page["items"][0]["changes"],
+                         [{"number": "BPI-E2", "before_revision": 3,
+                           "after_revision": 1}])
+
+    def test_multi_number_package_reports_each_changed_number_in_order(self):
+        release("BPI-F")
+        release("BPI-G")
+        pin = service.create_package(t2, self._known(),
+                                     ["BPI-F", "BPI-G"])["id"]
+        # 同批更正两个规程
+        service.submit_corrections([
+            item("BPI-F", "F1", t2, t3, base=0),
+            item("BPI-G", "G1", t2, t3, base=0)])
+        seq_f = self._seqs()[("correction", "BPI-F", 1)]
+        seq_g = self._seqs()[("correction", "BPI-G", 1)]
+        self.assertEqual(seq_f, seq_g)                 # 同批
+        page = service.trace_batch_package_impacts(seq_f)
+        self.assertEqual(page["count"], 1)
+        self.assertEqual(page["items"][0]["package_id"], pin)
+        self.assertEqual(page["items"][0]["change_count"], 2)
+        self.assertEqual([c["number"] for c in page["items"][0]["changes"]],
+                         ["BPI-F", "BPI-G"])            # 包内固定顺序
+
+    def test_package_fixed_content_unchanged_after_trace(self):
+        # 追查全程只读：包快照取回内容与固定时一致
+        release("BPI-H")
+        created = service.create_package(t2, self._known(),
+                                        ["BPI-H"])
+        correct("BPI-H", 0, t2, t3, "三月更正")
+        seq = self._seqs()[("correction", "BPI-H", 1)]
+        service.trace_batch_package_impacts(seq)
+        got = service.get_package(created["id"])
+        self.assertEqual(got["items"], created["items"])
+
+    def test_pagination_by_pin_order_no_dup_no_gap(self):
+        release("BPI-P")
+        pin_ids = [
+            service.create_package(t2, self._known(),
+                                   ["BPI-P"])["id"]
+            for _ in range(5)]
+        correct("BPI-P", 0, t2, t3, "三月更正")
+        seq = self._seqs()[("correction", "BPI-P", 1)]
+
+        seen: list[str] = []
+        cursor = None
+        pages = 0
+        while True:
+            page = service.trace_batch_package_impacts(seq, cursor, 2)
+            pages += 1
+            batch = [im["package_id"] for im in page["items"]]
+            self.assertEqual(len(batch), len(set(batch)))      # 页内不重
+            seen.extend(batch)
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        self.assertEqual(seen, pin_ids)                        # 固定顺序不遗漏
+        self.assertGreaterEqual(pages, 3)
+        # 尾游标再读为空页且游标不变
+        tail = service.trace_batch_package_impacts(seq, cursor, 2)
+        self.assertEqual(tail["items"], [])
+        self.assertFalse(tail["has_more"])
+        self.assertEqual(tail["next_cursor"], cursor)
+
+    def test_pagination_skips_unaffected_packages_in_ordering(self):
+        # 受影响与不受影响包交错固定，分页游标仍按固定顺序推进、不漏不重
+        release("BPI-Q")
+        release("BPI-R")
+        affected_ids: list[str] = []
+        for i in range(4):
+            affected_ids.append(service.create_package(
+                t2, self._known(), ["BPI-Q"])["id"])
+            service.create_package(
+                iso(_T + timedelta(days=10)),
+                self._known(), ["BPI-Q"])             # 1 月作业，区间外不受影响
+        correct("BPI-Q", 0, t2, t3, "三月更正")
+        seq = self._seqs()[("correction", "BPI-Q", 1)]
+        seen: list[str] = []
+        cursor = None
+        while True:
+            page = service.trace_batch_package_impacts(seq, cursor, 1)
+            seen.extend(im["package_id"] for im in page["items"])
+            cursor = page["next_cursor"]
+            if not page["has_more"]:
+                break
+        self.assertEqual(seen, affected_ids)
+
+    def test_invalid_batch_rejected(self):
+        release("BPI-X")
+        for bad in ("abc", "-1", "0", "1.0", "999999", "  "):
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(bad)
+            self.assertEqual(ctx.exception.code, "invalid_batch")
+
+    def test_invalid_limit_rejected(self):
+        release("BPI-Y")
+        seq = self._seqs()[("release", "BPI-Y", 0)]
+        for bad in ("0", "-5", "1001", "x", "1.0"):
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(seq, None, bad)
+            self.assertEqual(ctx.exception.code, "invalid_page_limit")
+
+    def test_invalid_cursor_rejected(self):
+        release("BPI-Z")
+        correct("BPI-Z", 0, t2, t3, "r1")
+        seq = self._seqs()[("correction", "BPI-Z", 1)]
+        for bad in ("not-a-cursor", "!!!",
+                    "W3siYSI6MX1d"):          # base64 合法但内容形状不符
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(seq, bad, 10)
+            self.assertEqual(ctx.exception.code, "invalid_cursor")
+        # 语法可解码、但指向不存在的包 -> 非法游标
+        forged = service._encode_impact_cursor(
+            "2026-01-01T00:00:00.000000Z", "deadbeef")
+        with self.assertRaises(DomainError) as ctx:
+            service.trace_batch_package_impacts(seq, forged, 10)
+        self.assertEqual(ctx.exception.code, "invalid_cursor")
+
+    def test_cursor_from_later_batch_rejected_for_earlier_batch(self):
+        release("BPI-K")
+        pin = service.create_package(t2, self._known(),
+                                     ["BPI-K"])["id"]
+        correct("BPI-K", 0, t2, t3, "r1")
+        correct("BPI-K", 1, iso(_T + timedelta(days=39)),
+                iso(_T + timedelta(days=49)), "r2")
+        seqs = self._seqs()
+        cursor = service.trace_batch_package_impacts(
+            seqs[("correction", "BPI-K", 2)], None, 1)["next_cursor"]
+        # 该游标位点（pin 早于批次 1）对批次 1 同样合法：
+        page = service.trace_batch_package_impacts(
+            seqs[("correction", "BPI-K", 1)], cursor, 10)
+        self.assertEqual([im["package_id"] for im in page["items"]], [pin])
+        # 但游标锚点晚于该批次提交时刻（批次后才固定的包）-> 非法游标：
+        later_pin = service.create_package(t2, self._known(),
+                                           ["BPI-K"])["id"]
+        import sqlite3
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            created = conn.execute(
+                "SELECT created_at FROM packages WHERE id = ?",
+                (later_pin,)).fetchone()[0]
+        finally:
+            conn.close()
+        token = service._encode_impact_cursor(created, later_pin)
+        with self.assertRaises(DomainError) as ctx:
+            service.trace_batch_package_impacts(
+                seqs[("correction", "BPI-K", 1)], token, 10)
+        self.assertEqual(ctx.exception.code, "invalid_cursor")
+
+    def test_backfilled_singleton_batches_are_traceable(self):
+        import sqlite3
+        import tempfile
+        from app.db import _SCHEMA, _connect, _write_lock, backfill_legacy_audit
+
+        path = tempfile.mktemp(prefix="sop-impact-backfill-", suffix=".db")
+        legacy = sqlite3.connect(path)
+        legacy.executescript(
+            """
+            CREATE TABLE procedures (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+            CREATE TABLE versions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                procedure_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                body TEXT NOT NULL, valid_start TEXT NOT NULL,
+                valid_end TEXT NOT NULL, supersedes_id INTEGER,
+                published_at TEXT NOT NULL,
+                UNIQUE(procedure_id, revision));
+            CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL UNIQUE, withdrawn_at TEXT NOT NULL);
+            INSERT INTO procedures (number, created_at) VALUES
+                ('BPI-OLD-1','2026-01-01T00:00:00.000000Z');
+            INSERT INTO versions (procedure_id, revision, body, valid_start,
+                valid_end, supersedes_id, published_at) VALUES
+                (1,0,'r0','2026-01-01T00:00:00.000000Z',
+                 '2027-01-01T00:00:00.000000Z',NULL,
+                 '2026-01-01T00:00:00.000000Z'),
+                (1,1,'r1','2026-03-01T00:00:00.000000Z',
+                 '2026-04-01T00:00:00.000000Z',1,
+                 '2026-02-01T00:00:00.000000Z');
+            """)
+        legacy.commit()
+        legacy.close()
+
+        old_path = settings.db_path
+        try:
+            object.__setattr__(settings, "db_path", path)
+            conn = _connect()
+            try:
+                conn.executescript(_SCHEMA)
+                with _write_lock:
+                    backfill_legacy_audit(conn)
+                # 模拟一个升级前固定的包（created_at 早于 r1 发布时刻）
+                conn.execute(
+                    "INSERT INTO packages (id, work_time, known_as_of, "
+                    "created_at, item_count) VALUES "
+                    "('oldpkg01','2026-03-15T00:00:00.000000Z',"
+                    "'2026-01-15T00:00:00.000000Z',"
+                    "'2026-01-10T00:00:00.000000Z',1)")
+                conn.execute(
+                    "INSERT INTO package_items (package_id, position, "
+                    "procedure_id, number, revision, body, valid_start, "
+                    "valid_end, supersedes_revision, published_at) VALUES "
+                    "('oldpkg01',0,1,'BPI-OLD-1',0,'r0',"
+                    "'2026-01-01T00:00:00.000000Z',"
+                    "'2027-01-01T00:00:00.000000Z',NULL,"
+                    "'2026-01-01T00:00:00.000000Z')")
+                conn.commit()
+            finally:
+                conn.close()
+
+            seqs = {(e["operation"], e["number"], e["revision"]):
+                    e["batch_seq"]
+                    for e in service.read_change_feed(None, 1000)["events"]}
+            # 回填的更正单事件批次也能追查到旧包 0->1
+            page = service.trace_batch_package_impacts(
+                seqs[("correction", "BPI-OLD-1", 1)])
+            self.assertEqual(page["count"], 1)
+            self.assertEqual(page["items"][0]["package_id"], "oldpkg01")
+            self.assertEqual(page["items"][0]["changes"],
+                             [{"number": "BPI-OLD-1",
+                               "before_revision": 0,
+                               "after_revision": 1}])
+        finally:
+            object.__setattr__(settings, "db_path", old_path)
+
+    def test_snapshot_consistent_under_concurrent_writes(self):
+        # 翻页期间并发提交新批次：追查针对的是已提交批次的固定结果集，
+        # 并发新写入（新批次、新包）不应改变该批次的受影响包集合。
+        release("BPI-S")
+        pin_ids = [
+            service.create_package(t2, self._known(),
+                                   ["BPI-S"])["id"]
+            for _ in range(4)]
+        correct("BPI-S", 0, t2, t3, "r1")
+        seq = self._seqs()[("correction", "BPI-S", 1)]
+
+        import threading
+        stop = threading.Event()
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                try:
+                    service.create_package(
+                        t2, self._known(), ["BPI-S"])
+                except DomainError:
+                    pass
+                i += 1
+
+        t = threading.Thread(target=writer)
+        t.start()
+        seen: list[str] = []
+        cursor = None
+        for _ in range(20):
+            page = service.trace_batch_package_impacts(seq, cursor, 1)
+            seen.extend(im["package_id"] for im in page["items"])
+            cursor = page["next_cursor"]
+        stop.set()
+        t.join()
+        # 并发写入的新包 created_at 均晚于批次提交时刻，永不进入结果集
+        self.assertTrue(set(seen).issubset(set(pin_ids)))
 
 
 if __name__ == "__main__":
