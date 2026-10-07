@@ -868,3 +868,44 @@ curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$WAIT_ID/approve" \
   -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
 curl -sS "$BASE_URL/api/v1/correction-proposals/$WAIT_ID" \
   -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
+
+# ------------------------------------------------------------------------
+# --- 49. 按审计批次追查受影响的既有作业包（调度员，只读） ---------------
+# 前置：上面的发布/更正/撤回/提案流程已产生多个审计批次与若干作业规程包。
+# ------------------------------------------------------------------------
+
+# 49a. 拉审计变动日志，拿到一个更正批次号（取第一条 correction 的 batch_seq）
+TRACE_BATCH=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=100" \
+  | python3 -c 'import sys,json
+for e in json.load(sys.stdin)["events"]:
+    if e["operation"] == "correction":
+        print(e["batch_seq"]); break')
+echo "追查更正批次: $TRACE_BATCH"
+
+# 49b. 首页（省略游标；limit 为每页扫描的包数）：仅返回批次提交前已固定、
+#      且包内规程在原作业时刻的实际适用版本因本批变化的条目
+curl -sS "$BASE_URL/api/v1/audit/batches/$TRACE_BATCH/package-impacts?cursor=0&limit=100"
+echo
+
+# 49c. 用 next_cursor 翻页；空页游标原样返回、has_more=false
+NEXT=$(curl -sS "$BASE_URL/api/v1/audit/batches/$TRACE_BATCH/package-impacts?limit=1" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')
+curl -sS "$BASE_URL/api/v1/audit/batches/$TRACE_BATCH/package-impacts?cursor=$NEXT&limit=1"
+echo
+
+# 49d. 撤回批次同样追查（版本变化形如 1 -> 0：撤回后恢复父版本）
+WD_BATCH=$(curl -sS "$BASE_URL/api/v1/audit/events?limit=100" \
+  | python3 -c 'import sys,json
+for e in json.load(sys.stdin)["events"]:
+    if e["operation"] == "withdrawal":
+        print(e["batch_seq"]); break')
+curl -sS "$BASE_URL/api/v1/audit/batches/$WD_BATCH/package-impacts"
+echo
+
+# 49e. 非法批次号 -> 422 invalid_batch_seq（0/负数/小数/非数字）
+curl -sS -i "$BASE_URL/api/v1/audit/batches/0/package-impacts"; echo
+# 49f. 批次不存在 -> 404 audit_batch_not_found
+curl -sS -i "$BASE_URL/api/v1/audit/batches/999999/package-impacts"; echo
+# 49g. 非法游标 / 页大小 -> 422 invalid_cursor / invalid_page_size
+curl -sS -i "$BASE_URL/api/v1/audit/batches/$TRACE_BATCH/package-impacts?cursor=nope"; echo
+curl -sS -i "$BASE_URL/api/v1/audit/batches/$TRACE_BATCH/package-impacts?limit=0"; echo

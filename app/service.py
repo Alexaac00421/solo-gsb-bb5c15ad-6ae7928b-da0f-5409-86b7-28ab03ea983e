@@ -111,6 +111,30 @@
 版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并标出
 因撤回导致的恢复、区间外空档与版本切换；相邻段仅在整组结果完全相同时
 合并。编号不存在、时间非法或知悉时刻晚于当前时刻均拒绝；全程只读。
+
+审计批次对既有作业包的影响追查
+------------------------------
+调度员拿到一个**已提交审计批次**号后，用 trace_batch_package_impacts 追查
+该批规程变动影响了哪些**批次提交前已固定**的作业规程包：
+
+- 追查只比对批次前后：版本可见性按**审计批次归属**重建——发布事件在
+  ``batch_seq`` 之前（严格小于）即批次前可见、在批次内（小于等于）即批次后
+  可见；撤回事件同理（撤回批次之前版本仍可见、批次内及之后不可见）。因此
+  同批多条事件（如先更正后撤回）按**整批结果**比较，批内中间状态不会被
+  当作最终变化。该重建基于审计表而非事件时刻模拟知悉时刻，与批次原子性
+  完全一致，升级回填的单事件批次同样适用。
+- 只统计固定时刻（``packages.created_at``）**严格早于**批次提交时刻的包
+  （同事务不可能固定包；回填批次的提交时刻取原版本/撤回行服务端时刻）。
+- 对每个受本批触及的规程，以**包内原作业时刻**（work_time）沿现有最深链
+  与左闭右开/撤回边界分别解析批次前后实际适用版本；任一侧无适用版本记为
+  null。撤回沿用现有父版本恢复语义，被撤回版本回落祖先；包的固定快照
+  （package_items）从不读取改写，取回内容永远是固定时原样。
+- 结果按**包固定顺序**（packages.rowid，包内按 position）键集分页：
+  游标为已扫描包的 rowid（省略/空/0 起始），页大小默认 100、最大 1000，
+  扫描多取一个包判定 has_more，无变化的包也占位，故翻页不重复不遗漏；
+  整页在进入时固定的同一只读快照事务内完成。批次非法（非正整数）->
+  422 invalid_batch_seq，批次不存在 -> 404 audit_batch_not_found，
+  游标非法 -> 422 invalid_cursor，页大小非法 -> 422 invalid_page_size。
 """
 from __future__ import annotations
 
@@ -1072,6 +1096,174 @@ def read_change_feed(cursor_raw: str | None, limit_raw=None) -> dict:
     return {"cursor": str(cursor), "next_cursor": str(next_cursor),
             "limit": limit, "has_more": has_more,
             "count": len(events), "events": events}
+
+# -------------------------------------------- 审计批次对既有作业包的影响追查
+
+
+DEFAULT_IMPACT_PAGE_SIZE = 100
+MAX_IMPACT_PAGE_SIZE = 1000
+
+
+def _parse_batch_seq(raw) -> int:
+    """解析路径中的审计批次号：必须为正整数串（0/负数/小数/非数字均非法）。"""
+    text = str(raw).strip()
+    if not text.isdigit() or int(text) <= 0:
+        raise errors.invalid_batch_seq(text)
+    return int(text)
+
+
+def _parse_page_size(raw) -> int:
+    if raw is None:
+        return DEFAULT_IMPACT_PAGE_SIZE
+    text = str(raw).strip()
+    if not text.isdigit() or not (1 <= int(text) <= MAX_IMPACT_PAGE_SIZE):
+        raise errors.invalid_page_size(text)
+    return int(text)
+
+
+def trace_batch_package_impacts(batch_seq_raw, cursor_raw: str | None,
+                               page_size_raw=None) -> dict:
+    """调度员按已提交审计批次追查受其变动影响的**既有作业规程包**（只读）。
+
+    返回该批次**提交前已固定**的包中，包内规程在**原作业时刻**的实际适用
+    版本因本批发布、更正或撤回而发生变化的条目（包标识、变化编号、批次前后
+    版本号；任一侧无适用版本记为 null）。
+
+    批次前后状态按**审计批次归属**重建，而非按事件时刻模拟知悉时刻：
+
+    * 前侧（批次前）：版本在其发布审计批次 ``seq < batch_seq`` 时已存在；
+      撤回在其撤回审计批次 ``seq < batch_seq`` 时已生效（版本不可见）。
+    * 后侧（批次后）：发布批次 ``seq <= batch_seq`` 即可见，撤回批次
+      ``seq <= batch_seq`` 即不可见——同批多条事件由此按**整批结果**比较，
+      批内"先更正后撤回"等中间状态不会被当作最终变化。
+    * 撤回沿用现有父版本恢复与知悉时刻边界（左闭右开、最深链取适用版本）：
+      被撤回版本不参与候选，其覆盖子区间自然回落祖先版本；包的固定内容
+      （package_items 快照）永不被读取或改写。
+
+    追查范围仅含固定时刻 ``created_at`` **严格早于**批次提交时刻的包
+    （批次事件时刻）；同事务不可能固定包，时刻相等同样排除。升级回填的
+    单事件批次按同一规则可追查（其提交时刻取原版本/撤回行的服务端时刻）。
+
+    结果按**包固定顺序**（packages.rowid，即固定落库顺序）键集分页：
+    ``cursor`` 为上一页 ``next_cursor``（省略/空/0 为起始），页大小
+    ``limit`` 默认 100、最大 1000；扫描比页大小多取 1 个包判定 has_more，
+    游标随**已扫描包**前进（无变化的包也占位），翻页不重复不遗漏。整页在
+    进入时固定的同一只读快照内完成。批次非法（非正整数）-> 422
+    invalid_batch_seq；批次不存在 -> 404 audit_batch_not_found；游标非法
+    -> 422 invalid_cursor；页大小非法 -> 422 invalid_page_size。
+    """
+    batch_seq = _parse_batch_seq(batch_seq_raw)
+    cursor = _parse_cursor(cursor_raw)
+    limit = _parse_page_size(page_size_raw)
+
+    with read_snapshot() as conn:
+        batch = conn.execute(
+            "SELECT seq, event_count FROM audit_batches WHERE seq = ?",
+            (batch_seq,)).fetchone()
+        if batch is None:
+            raise errors.audit_batch_not_found(batch_seq)
+        if cursor > 0 and conn.execute(
+                "SELECT 1 FROM packages WHERE rowid = ?",
+                (cursor,)).fetchone() is None:
+            raise errors.invalid_cursor(str(cursor))
+
+        # 批次提交时刻：同批事件共享同一服务端时刻（一次写事务一个时钟值）。
+        committed_at = conn.execute(
+            "SELECT MIN(event_time) AS t FROM audit_events WHERE batch_seq = ?",
+            (batch_seq,)).fetchone()["t"]
+
+        # 本批涉及的规程编号（同批多条事件按整批结果比较，事件明细不参与过滤）。
+        touched = {r["procedure_number"] for r in conn.execute(
+            "SELECT procedure_number FROM audit_events WHERE batch_seq = ?",
+            (batch_seq,)).fetchall()}
+
+        # 仅追查批次提交前已固定的包；按固定顺序键集取 limit+1 个判定翻页。
+        package_rows = conn.execute(
+            "SELECT rowid AS rid, id, work_time FROM packages "
+            "WHERE rowid > ? AND created_at < ? ORDER BY rowid LIMIT ?",
+            (cursor, committed_at, limit + 1)).fetchall()
+        has_more = len(package_rows) > limit
+        page_rows = package_rows[:limit]
+        next_cursor = page_rows[-1]["rid"] if page_rows else cursor
+
+        # 本页包中、且规程被本批触及的包内条目（未被本批触及的规程不可能
+        # 变化）；顺序与外层分页一致按包固定 rowid，包内按固定请求位置。
+        placeholders = ",".join("?" * len(page_rows))
+        item_rows = conn.execute(
+            f"SELECT pi.* FROM package_items pi "
+            f"JOIN packages pk ON pk.id = pi.package_id "
+            f"WHERE pk.rowid IN ({placeholders}) "
+            f"ORDER BY pk.rowid, pi.position",
+            tuple(r["rid"] for r in page_rows)).fetchall() if page_rows else []
+        candidate_items = [r for r in item_rows if r["number"] in touched]
+
+        # 候选规程的全部版本（含已撤回版本：深度链计算需要不可见祖先），
+        # 以及 版本id -> 发布批次 / 撤回批次 的归属映射（回填批次同样在表内）。
+        changes: list[dict] = []
+        if candidate_items:
+            numbers = {r["number"] for r in candidate_items}
+            num_list = list(numbers)
+            num_ph = ",".join("?" * len(num_list))
+            versions = conn.execute(
+                f"""
+                SELECT v.id, v.procedure_id, v.revision, v.valid_start,
+                       v.valid_end, v.supersedes_id, p.number AS number,
+                       pub.batch_seq AS pub_seq,
+                       wd.batch_seq AS withdrawal_seq
+                  FROM versions v
+                  JOIN procedures p ON p.id = v.procedure_id
+                  JOIN audit_events pub ON pub.version_id = v.id
+                       AND pub.operation IN ('release', 'correction')
+                  LEFT JOIN withdrawals w ON w.version_id = v.id
+                  LEFT JOIN audit_events wd ON wd.version_id = v.id
+                       AND wd.operation = 'withdrawal'
+                 WHERE p.number IN ({num_ph})
+                """, tuple(num_list)).fetchall()
+            by_number: dict[str, list[sqlite3.Row]] = {}
+            for v in versions:
+                by_number.setdefault(v["number"], []).append(v)
+
+            work_time_by_pkg = {r["id"]: r["work_time"] for r in page_rows}
+            for it in candidate_items:
+                rows = by_number.get(it["number"], [])
+                by_id = {v["id"]: v for v in rows}
+                depth_cache: dict[int, int] = {}
+                before_rows = [
+                    v for v in rows
+                    if v["pub_seq"] < batch_seq
+                    and (v["withdrawal_seq"] is None
+                         or v["withdrawal_seq"] >= batch_seq)]
+                after_rows = [
+                    v for v in rows
+                    if v["pub_seq"] <= batch_seq
+                    and (v["withdrawal_seq"] is None
+                         or v["withdrawal_seq"] > batch_seq)]
+                work_time = work_time_by_pkg[it["package_id"]]
+                before = _effective_at(work_time, before_rows, by_id,
+                                       depth_cache)
+                after = _effective_at(work_time, after_rows, by_id,
+                                      depth_cache)
+                before_rev = before["revision"] if before is not None else None
+                after_rev = after["revision"] if after is not None else None
+                # 是否变化只看版本号（与复核、两知悉时刻对比约定一致）；
+                # 一侧无适用版本（null）、另一侧有版本同样记为变化。
+                if before_rev != after_rev:
+                    changes.append({
+                        "package_id": it["package_id"],
+                        "position": it["position"],
+                        "number": it["number"],
+                        "before_revision": before_rev,
+                        "after_revision": after_rev,
+                    })
+
+    return {"batch_seq": batch_seq,
+            "committed_at": committed_at,
+            "cursor": str(cursor),
+            "next_cursor": str(next_cursor),
+            "limit": limit,
+            "has_more": has_more,
+            "count": len(changes),
+            "changes": changes}
 
 # ---------------------------------------------------------------- 回溯查询
 

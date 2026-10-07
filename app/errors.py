@@ -286,6 +286,32 @@ def page_limit_too_small(limit: int, batch_seq: int, batch_size: int) -> DomainE
                  "batch_size": batch_size})
 
 
+# ----------------------------------------------------- 批次包影响追查（调度员）
+
+
+def invalid_batch_seq(value: str) -> DomainError:
+    return DomainError(
+        "invalid_batch_seq",
+        f"非法审计批次号 {value!r}：批次号必须是已提交审计批次的正整数序号"
+        f"（见 /api/v1/audit/events 返回的 batch_seq）",
+        http_status=422, details={"batch_seq": value})
+
+
+def audit_batch_not_found(batch_seq: int) -> DomainError:
+    return DomainError(
+        "audit_batch_not_found",
+        f"审计批次 {batch_seq} 不存在：只有已提交事务才产生批次，"
+        f"回滚的整批校验失败不留下批次",
+        http_status=404, details={"batch_seq": batch_seq})
+
+
+def invalid_page_size(value: str) -> DomainError:
+    return DomainError(
+        "invalid_page_size",
+        f"每页包数上限非法：{value!r} 必须是 1..1000 的整数",
+        http_status=422, details={"limit": value, "max": 1000})
+
+
 # ---------------------------------------------------------------- 待审更正提案
 
 

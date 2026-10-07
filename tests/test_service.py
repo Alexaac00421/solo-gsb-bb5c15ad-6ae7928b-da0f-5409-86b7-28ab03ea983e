@@ -3832,5 +3832,424 @@ class AuditBackfillTests(unittest.TestCase):
             object.__setattr__(settings, "db_path", old_path)
 
 
+class BatchPackageImpactTests(unittest.TestCase):
+    """调度员按已提交审计批次追查批次提交前已固定作业包的规程版本变化。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _batch_seq(self, operation: str, number: str | None = None) -> int:
+        events = service.read_change_feed(None, 1000)["events"]
+        chosen = [e for e in events if e["operation"] == operation
+                  and (number is None or e["number"] == number)]
+        return chosen[-1]["batch_seq"]
+
+    def _release_two(self, a="BI-A", b="BI-B"):
+        service.publish_releases([item(a, "初版A", t1, t5),
+                                  item(b, "初版B", t1, t5)])
+
+    def test_correction_batch_changes_pinned_packages(self):
+        self._release_two()
+        release_at = service.read_change_feed(None, 10)["events"][0]["event_time"]
+        pkg = service.create_package(t2, release_at, ["BI-A", "BI-B"])
+        # 另一个固定更早/更晚的包：只取受本批触及的规程
+        pkg_early = service.create_package(t2, release_at, ["BI-B"])
+        res = service.submit_corrections(
+            [item("BI-A", "三月版", t2, t3, 0)])
+        bseq = self._batch_seq("correction", "BI-A")
+
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["batch_seq"], bseq)
+        self.assertEqual(page["committed_at"], res["published_at"])
+        self.assertEqual(page["limit"], 100)
+        self.assertFalse(page["has_more"])
+        self.assertEqual(page["cursor"], "0")
+        # next_cursor 为已扫描到的最后一个包（按固定顺序）
+        self.assertEqual(page["count"], 1)
+        ch = page["changes"][0]
+        self.assertEqual(ch["package_id"], pkg["id"])
+        self.assertEqual(ch["position"], 0)
+        self.assertEqual(ch["number"], "BI-A")
+        self.assertEqual(ch["before_revision"], 0)
+        self.assertEqual(ch["after_revision"], 1)
+        # 游标随已扫描包前进（pkg_early 也被扫描，只是无变化）
+        self.assertNotEqual(page["next_cursor"], "0")
+
+        # 包固定内容保持原样（仍含 r0 正文）
+        stored = service.get_package(pkg["id"])["items"][0]
+        self.assertEqual(stored["revision"], 0)
+        self.assertEqual(stored["body"], "初版A")
+
+    def test_withdrawal_batch_restores_parent_revision(self):
+        self._release_two("WD-A", "WD-B")
+        release_at = service.read_change_feed(None, 10)["events"][0]["event_time"]
+        pkg = service.create_package(t2, release_at, ["WD-A", "WD-B"])
+        service.submit_corrections(
+            [item("WD-A", "三月版", t2, t3, 0)])
+        wd = service.withdraw_corrections([witem("WD-A", 1)])
+        bseq = self._batch_seq("withdrawal", "WD-A")
+
+        page = service.trace_batch_package_impacts(bseq, None, 100)
+        self.assertEqual(page["committed_at"], wd["withdrawn_at"])
+        self.assertEqual(page["count"], 1)
+        ch = page["changes"][0]
+        self.assertEqual(ch["package_id"], pkg["id"])
+        self.assertEqual(ch["before_revision"], 1)
+        self.assertEqual(ch["after_revision"], 0)      # 撤回沿用父版本恢复
+        self.assertEqual(ch["number"], "WD-A")
+
+    def test_release_batch_does_not_affect_existing_packages(self):
+        # 先固定一个只含 X 的包（X 首版发布 = 批次 1）
+        release("RL-X")
+        pkg = service.create_package(
+            t2, service.read_change_feed(None, 10)["events"][0]["event_time"],
+            ["RL-X"])
+        # 之后首次发布全新规程 Y（批次 2）：新编号不可能在既有包内
+        release("RL-Y")
+        bseq = self._batch_seq("release", "RL-Y")
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["count"], 0)
+        self.assertEqual(page["changes"], [])
+        self.assertFalse(page["has_more"])
+        # 空页游标停在已扫描的最后一个包（pkg 自身），用该游标再读仍为空
+        again = service.trace_batch_package_impacts(bseq, page["next_cursor"])
+        self.assertEqual(again["changes"], [])
+        self.assertEqual(again["next_cursor"], page["next_cursor"])
+        self.assertFalse(again["has_more"])
+
+    def test_packages_fixed_after_batch_are_excluded(self):
+        release("AF-X")
+        # 更正批次先提交
+        service.submit_corrections(
+            [item("AF-X", "三月版", t2, t3, 0)])
+        bseq = self._batch_seq("correction", "AF-X")
+        # 包在更正批次之后才固定（已直接看到 r1）：不受该批"追查"
+        pkg = service.create_package(t2, now_canonical(), ["AF-X"])
+        self.assertEqual(pkg["items"][0]["revision"], 1)
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["count"], 0)
+        self.assertEqual(page["changes"], [])
+
+    def test_in_batch_chain_compared_as_whole_batch(self):
+        # 同批两条链式更正：r1 覆盖 [t2,t4)，r2 以同批拟生成的 r1 为基版
+        # 覆盖 [t3,t4)。批内中间状态（r1）不得当作最终变化：整批后 r0 -> r2。
+        release("CH-X")
+        release_at = service.read_change_feed(None, 10)["events"][0]["event_time"]
+        service.create_package(t3, release_at, ["CH-X"])
+        res = service.submit_corrections([
+            item("CH-X", "r1正文", t2, t4, 0),
+            item("CH-X", "r2正文", t3, t4, 1),
+        ])
+        self.assertEqual([i["revision"] for i in res["items"]], [1, 2])
+        bseq = self._batch_seq("correction", "CH-X")
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["count"], 1)
+        ch = page["changes"][0]
+        self.assertEqual(ch["before_revision"], 0)
+        self.assertEqual(ch["after_revision"], 2)       # 不是批内的中间版本 1
+
+    def test_work_time_outside_batch_intervals_no_change(self):
+        # 包的作业时刻落在更正区间外：实际适用版本不变，不返回
+        release("OT-X")
+        release_at = service.read_change_feed(None, 10)["events"][0]["event_time"]
+        service.create_package(t2, release_at, ["OT-X"])
+        service.submit_corrections(
+            [item("OT-X", "三月版", t3, t4, 0)])
+        bseq = self._batch_seq("correction", "OT-X")
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["count"], 0)
+
+    def test_before_is_state_just_before_target_batch_not_pinned(self):
+        # 包固定 r0；目标批次之前已有 r1（另一更正批次）；目标批次再发 r2。
+        # before 必须取紧邻目标批次前的状态（r1），而非包内固定版本（r0）。
+        release("IB-X")
+        release_at = service.read_change_feed(None, 10)["events"][0]["event_time"]
+        pkg = service.create_package(t3, release_at, ["IB-X"])
+        # r1 覆盖 [t2,t4)
+        service.submit_corrections(
+            [item("IB-X", "r1正文", t2, t4, 0)])
+        # r2 覆盖 [t3,t4)（以 r1 为基版）
+        service.submit_corrections(
+            [item("IB-X", "r2正文", t3, t4, 1)])
+        bseq = self._last_batch_seq("correction")
+        page = service.trace_batch_package_impacts(bseq, None, None)
+        self.assertEqual(page["count"], 1)
+        ch = page["changes"][0]
+        self.assertEqual(ch["package_id"], pkg["id"])
+        self.assertEqual(ch["before_revision"], 1)
+        self.assertEqual(ch["after_revision"], 2)
+
+    def _last_batch_seq(self, operation: str) -> int:
+        return [e for e in service.read_change_feed(None, 1000)["events"]
+                if e["operation"] == operation][-1]["batch_seq"]
+
+    def test_pagination_by_package_fixation_order_no_dup_no_gap(self):
+        # 4 个规程；分批更正 A、C 两个规程，固定 5 个包（顺序交错）
+        for n in ("PG-A", "PG-B", "PG-C", "PG-D"):
+            release(n)
+        known = now_canonical()
+        ids_in_order: list[str] = []
+        ids_in_order.append(service.create_package(
+            t2, known, ["PG-A"])["id"])
+        ids_in_order.append(service.create_package(
+            t2, known, ["PG-B"])["id"])
+        ids_in_order.append(service.create_package(
+            t2, known, ["PG-C"])["id"])
+        ids_in_order.append(service.create_package(
+            t2, known, ["PG-A", "PG-C"])["id"])
+        ids_in_order.append(service.create_package(
+            t2, known, ["PG-D"])["id"])
+        service.submit_corrections([
+            item("PG-A", "A三月", t2, t3, 0),
+            item("PG-C", "C三月", t2, t3, 0)])
+        bseq = self._batch_seq("correction", "PG-A")
+
+        # limit=2：仅扫描前 2 个包（多取 1 用于 has_more），返回第 1 个包
+        # 的变化（第 2 个包仅含 PG-B，未变）
+        p1 = service.trace_batch_package_impacts(bseq, None, 2)
+        self.assertTrue(p1["has_more"])
+        self.assertEqual([c["package_id"] for c in p1["changes"]],
+                         [ids_in_order[0]])
+        self.assertEqual(p1["count"], 1)
+
+        p2 = service.trace_batch_package_impacts(bseq, p1["next_cursor"], 2)
+        self.assertTrue(p2["has_more"])
+        self.assertEqual([c["package_id"] for c in p2["changes"]],
+                         [ids_in_order[2], ids_in_order[3], ids_in_order[3]])
+        self.assertEqual([c["number"] for c in p2["changes"]],
+                         ["PG-C", "PG-A", "PG-C"])
+        # 第三页扫描最后一个包（仅含 PG-D，无变化）
+        p3 = service.trace_batch_package_impacts(bseq, p2["next_cursor"], 2)
+        self.assertFalse(p3["has_more"])
+        self.assertEqual(p3["changes"], [])
+        # 游标单调、不回退；全集去重无遗漏
+        self.assertGreater(int(p2["next_cursor"]), int(p1["next_cursor"]))
+        all_ids = ({c["package_id"] for c in p1["changes"]}
+                   | {c["package_id"] for c in p2["changes"]}
+                   | {c["package_id"] for c in p3["changes"]})
+        self.assertEqual(all_ids, {ids_in_order[0], ids_in_order[2],
+                                   ids_in_order[3]})
+
+    def test_cursor_points_to_scanned_package(self):
+        # 首包无变化时 next_cursor 仍指向它：下一页从其后继续，不重复
+        release("CU-A")
+        release("CU-B")
+        first = service.create_package(t2, now_canonical(), ["CU-A"])
+        second = service.create_package(t2, now_canonical(), ["CU-B"])
+        service.submit_corrections(
+            [item("CU-B", "B三月", t2, t3, 0)])
+        bseq = self._batch_seq("correction", "CU-B")
+
+        p1 = service.trace_batch_package_impacts(bseq, None, 1)
+        self.assertEqual(p1["changes"], [])                 # 第一个包未变化
+        self.assertTrue(p1["has_more"])
+        p2 = service.trace_batch_package_impacts(bseq, p1["next_cursor"], 1)
+        self.assertEqual([c["package_id"] for c in p2["changes"]],
+                         [second["id"]])
+        self.assertFalse(p2["has_more"])
+
+    def test_invalid_batch_seq_rejected(self):
+        release("IV-X")
+        for bad in ("0", "-1", "1.5", "abc", ""):
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(bad, None, None)
+            self.assertEqual(ctx.exception.code, "invalid_batch_seq")
+            self.assertEqual(ctx.exception.http_status, 422)
+
+    def test_unknown_batch_seq_404(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.trace_batch_package_impacts(999999, None, None)
+        self.assertEqual(ctx.exception.code, "audit_batch_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_invalid_cursor_and_page_size(self):
+        release("IC-X")
+        bseq = self._batch_seq("release", "IC-X")
+        for bad in ("abc", "-1", "1.0"):
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(bseq, bad, None)
+            self.assertEqual(ctx.exception.code, "invalid_cursor")
+        # 游标语法合法但不指向任何包
+        with self.assertRaises(DomainError) as ctx:
+            service.trace_batch_package_impacts(bseq, "999999", None)
+        self.assertEqual(ctx.exception.code, "invalid_cursor")
+        for bad in ("0", "-1", "1001", "abc", "1.0"):
+            with self.assertRaises(DomainError) as ctx:
+                service.trace_batch_package_impacts(bseq, None, bad)
+            self.assertEqual(ctx.exception.code, "invalid_page_size")
+            self.assertEqual(ctx.exception.details["max"], 1000)
+
+    def test_backfilled_legacy_batch_is_traceable(self):
+        import sqlite3
+        import tempfile
+        from app.db import _SCHEMA, _connect, _write_lock, backfill_legacy_audit
+
+        path = tempfile.mktemp(prefix="sop-impact-backfill-", suffix=".db")
+        # 模拟"升级前"的旧库：已有版本/撤回与**作业包快照表**，但尚无审计表
+        # （packages 表先于审计功能上线）。包在更正发布后、审计升级前固定，
+        # 固定时刻早于稍后回填出的更正批次时刻是可构造的真实情形。
+        legacy = sqlite3.connect(path)
+        legacy.executescript(
+            """
+            CREATE TABLE procedures (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+            CREATE TABLE versions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                procedure_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                body TEXT NOT NULL, valid_start TEXT NOT NULL,
+                valid_end TEXT NOT NULL, supersedes_id INTEGER,
+                published_at TEXT NOT NULL,
+                UNIQUE(procedure_id, revision));
+            CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL UNIQUE, withdrawn_at TEXT NOT NULL);
+            CREATE TABLE packages (id TEXT PRIMARY KEY, work_time TEXT NOT NULL,
+                known_as_of TEXT NOT NULL, created_at TEXT NOT NULL,
+                item_count INTEGER NOT NULL);
+            CREATE TABLE package_items (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id TEXT NOT NULL, position INTEGER NOT NULL,
+                procedure_id INTEGER NOT NULL, number TEXT NOT NULL,
+                revision INTEGER NOT NULL, body TEXT NOT NULL,
+                valid_start TEXT NOT NULL, valid_end TEXT NOT NULL,
+                supersedes_revision INTEGER, published_at TEXT NOT NULL,
+                UNIQUE(package_id, position));
+            """)
+        legacy.execute(
+            "INSERT INTO procedures (number, created_at) VALUES "
+            "('LGB-X','2026-01-01T00:00:00.000000Z')")
+        legacy.execute(
+            "INSERT INTO versions (procedure_id, revision, body, valid_start, "
+            "valid_end, supersedes_id, published_at) VALUES "
+            "(1,0,'r0','2026-01-01T00:00:00.000000Z',"
+            "'2027-01-01T00:00:00.000000Z',NULL,"
+            "'2026-01-01T00:00:00.000000Z'),"
+            "(1,1,'r1','2026-03-01T00:00:00.000000Z',"
+            "'2026-04-01T00:00:00.000000Z',1,"
+            "'2026-02-01T00:00:00.000000Z')")
+        # 旧包：作业时刻 t2（落在 r1 区间），固定于 2026-01-15（r0 已发布、
+        # r1 尚未发布、审计功能也尚未上线），快照内容为 r0。
+        legacy.execute(
+            "INSERT INTO packages (id, work_time, known_as_of, created_at, "
+            "item_count) VALUES ('legacy-pkg','2026-03-01T00:00:00.000000Z',"
+            "'2026-01-15T00:00:00.000000Z','2026-01-15T00:00:00.000000Z',1)")
+        legacy.execute(
+            "INSERT INTO package_items (package_id, position, procedure_id, "
+            "number, revision, body, valid_start, valid_end, "
+            "supersedes_revision, published_at) VALUES "
+            "('legacy-pkg',0,1,'LGB-X',0,'r0','2026-01-01T00:00:00.000000Z',"
+            "'2027-01-01T00:00:00.000000Z',NULL,"
+            "'2026-01-01T00:00:00.000000Z')")
+        legacy.commit()
+        legacy.close()
+
+        old_path = settings.db_path
+        try:
+            object.__setattr__(settings, "db_path", path)
+            conn = _connect()
+            try:
+                conn.executescript(_SCHEMA)
+                with _write_lock:
+                    # r0 发布 + r1 更正各回填为一个单事件批次
+                    self.assertEqual(backfill_legacy_audit(conn), 2)
+                conn.commit()
+            finally:
+                conn.close()
+
+            feed = service.read_change_feed(None, 100)["events"]
+            rel = [e for e in feed if e["operation"] == "release"][0]
+            corr = [e for e in feed if e["operation"] == "correction"][0]
+
+            # 首版发布批次提交时刻（2026-01-01）早于包固定时刻 -> 包不被追查
+            page0 = service.trace_batch_package_impacts(
+                rel["batch_seq"], None, None)
+            self.assertEqual(page0["count"], 0)
+
+            # 回填的更正批次（单事件）按原服务端时刻追查：0 -> 1
+            page = service.trace_batch_package_impacts(
+                corr["batch_seq"], None, None)
+            self.assertEqual(page["committed_at"],
+                             "2026-02-01T00:00:00.000000Z")
+            self.assertEqual(page["count"], 1)
+            ch = page["changes"][0]
+            self.assertEqual(ch["package_id"], "legacy-pkg")
+            self.assertEqual(ch["number"], "LGB-X")
+            self.assertEqual(ch["before_revision"], 0)
+            self.assertEqual(ch["after_revision"], 1)
+
+            # 包的固定内容保持原样（快照 r0 不被追查读取改写）
+            stored = service.get_package("legacy-pkg")
+            self.assertEqual(stored["items"][0]["revision"], 0)
+            self.assertEqual(stored["items"][0]["body"], "r0")
+        finally:
+            object.__setattr__(settings, "db_path", old_path)
+
+
+class BatchPackageImpactHttpTests(unittest.TestCase):
+    """HTTP 层：批次包影响追查接口。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+            from app.main import app
+        except Exception:
+            raise unittest.SkipTest("fastapi/httpx 未安装，跳过 API 测试")
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        reset_db()
+
+    def test_trace_over_http(self):
+        c = self.client
+        c.post("/api/v1/releases", json={
+            "number": "HB-X", "body": "初版",
+            "valid_start": t1, "valid_end": t5})
+        known = c.get("/api/v1/audit/events?limit=10").json()["events"][0]
+        c.post("/api/v1/packages", json={
+            "work_time": t2, "known_as_of": known["event_time"],
+            "numbers": ["HB-X"]})
+        c.post("/api/v1/corrections", json={
+            "number": "HB-X", "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月版"})
+        corr = [e for e in c.get("/api/v1/audit/events?limit=10").json()["events"]
+                if e["operation"] == "correction"][0]
+        bseq = corr["batch_seq"]
+
+        r = c.get(f"/api/v1/audit/batches/{bseq}/package-impacts")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["batch_seq"], bseq)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["changes"][0]["number"], "HB-X")
+        self.assertEqual(body["changes"][0]["before_revision"], 0)
+        self.assertEqual(body["changes"][0]["after_revision"], 1)
+        self.assertFalse(body["has_more"])
+
+        # 分页参数透传
+        r = c.get(f"/api/v1/audit/batches/{bseq}/package-impacts",
+                  params={"cursor": "0", "limit": "1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["limit"], 1)
+
+        # 批次号 0 -> 422 invalid_batch_seq
+        r = c.get("/api/v1/audit/batches/0/package-impacts")
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_batch_seq")
+        # 批次不存在 -> 404 audit_batch_not_found
+        r = c.get("/api/v1/audit/batches/999999/package-impacts")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "audit_batch_not_found")
+        # 非法游标 / 页大小 -> 422
+        r = c.get(f"/api/v1/audit/batches/{bseq}/package-impacts",
+                  params={"cursor": "nope"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_cursor")
+        r = c.get(f"/api/v1/audit/batches/{bseq}/package-impacts",
+                  params={"limit": "0"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_page_size")
+        # 缺批次号 -> 404 路由不匹配（FastAPI 默认 404）
+        r = c.get("/api/v1/audit/batches//package-impacts")
+        self.assertEqual(r.status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

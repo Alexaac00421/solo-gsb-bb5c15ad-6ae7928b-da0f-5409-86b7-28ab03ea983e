@@ -19,15 +19,17 @@ from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
-    version="1.1.0",
+    version="1.2.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
                  "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
                  "多条更正正式提交前的只读批量预演（不写历史、不占版本号）、"
                  "值班员凭本地凭证提交/审核待审更正提案（批准时在同一事务内"
-                 "重验整批并写入原审计批次），以及调度员安排跨规程作业前的"
-                 "版本覆盖检查（逐段整组状态）。"),
+                 "重验整批并写入原审计批次）、调度员安排跨规程作业前的"
+                 "版本覆盖检查（逐段整组状态），以及调度员按已提交审计批次"
+                 "追查批次提交前已固定作业包中受本批发布/更正/撤回影响的"
+                 "包（按包固定顺序键集分页、整批前后版本号对比、只读快照）。"),
 )
 
 
@@ -83,6 +85,7 @@ def index() -> dict:
                 "POST /api/v1/correction-proposals/{proposal_id}/approve",
                 "POST /api/v1/correction-proposals/{proposal_id}/reject",
                 "GET  /api/v1/audit/events",
+                "GET  /api/v1/audit/batches/{batch_seq}/package-impacts",
             ]}
 
 
@@ -377,3 +380,29 @@ def audit_events(cursor: str | None = None,
     422 invalid_page_limit。
     """
     return service.read_change_feed(cursor, limit)
+
+
+@app.get("/api/v1/audit/batches/{batch_seq}/package-impacts")
+def batch_package_impacts(batch_seq: str, cursor: str | None = None,
+                          limit: str | None = None) -> dict:
+    """按已提交审计批次追查受其规程变动影响的**既有作业规程包**（调度员，只读）。
+
+    路径参数 ``batch_seq`` 为审计批次号（``/api/v1/audit/events`` 返回的
+    ``batch_seq``，正整数）；查询参数 ``cursor`` 为上一页响应的
+    ``next_cursor``（省略/空/0 表示从包固定顺序起点开始），``limit`` 为
+    每页扫描的包数上限（默认 100、最大 1000）。
+
+    仅统计该批次**提交前已固定**（``packages.created_at`` 严格早于批次
+    提交时刻）的包：对每个包以**包内原作业时刻**重新解析本批涉及规程的实际
+    适用版本，返回批次前后版本号不同（含一侧无适用版本记为 null）的条目
+    （包标识、变化编号、before/after_revision），按包固定顺序（包内按规程
+    在固定请求中的位置）排列。同批多条事件按**整批结果**比较，批内中间状态
+    不算最终变化；撤回沿用现有父版本恢复与知悉时刻边界，包的固定内容
+    （取回快照）永不改变。
+
+    整页在进入时固定的同一只读快照内完成，翻页不重复不遗漏。批次号非正整数
+    -> 422 invalid_batch_seq；批次不存在 -> 404 audit_batch_not_found；
+    非法游标 -> 422 invalid_cursor；页大小非 1..1000 整数 -> 422
+    invalid_page_size。升级回填的单事件审计批次同样可追查。
+    """
+    return service.trace_batch_package_impacts(batch_seq, cursor, limit)
